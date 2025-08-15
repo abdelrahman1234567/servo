@@ -26,8 +26,8 @@ use devtools_traits::ScriptToDevtoolsControlMsg;
 use dom_struct::dom_struct;
 use embedder_traits::{AllowOrDeny, AnimationState, EmbedderMsg, FocusSequenceNumber, LoadStatus};
 use encoding_rs::{Encoding, UTF_8};
-use euclid::Point2D;
 use euclid::default::{Rect, Size2D};
+use euclid::{Point2D, Vector2D};
 use fnv::FnvHashMap;
 use html5ever::{LocalName, Namespace, QualName, local_name, ns};
 use hyper_serde::Serde;
@@ -203,6 +203,7 @@ use crate::network_listener::{NetworkListener, PreInvoke};
 use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
 use crate::script_runtime::{CanGc, ScriptThreadEventCategory};
 use crate::script_thread::{ScriptThread, with_script_thread};
+use crate::smooth_scroll::SmoothScrollAnimations;
 use crate::stylesheet_set::StylesheetSetRef;
 use crate::task::NonSendTaskBox;
 use crate::task_source::TaskSourceName;
@@ -496,6 +497,8 @@ pub(crate) struct Document {
     animation_timeline: DomRefCell<AnimationTimeline>,
     /// Animations for this Document
     animations: DomRefCell<Animations>,
+    /// Smooth scroll animations for this Document
+    smooth_scroll_animations: DomRefCell<SmoothScrollAnimations>,
     /// Image Animation Manager for this Document
     image_animation_manager: DomRefCell<ImageAnimationManager>,
     /// The nearest inclusive ancestors to all the nodes that require a restyle.
@@ -1389,7 +1392,7 @@ impl Document {
                     elem.ScrollIntoView(BooleanOrScrollIntoViewOptions::ScrollIntoViewOptions(
                         ScrollIntoViewOptions {
                             parent: ScrollOptions {
-                                behavior: ScrollBehavior::Smooth,
+                                behavior: ScrollBehavior::Auto,
                             },
                             block: ScrollLogicalPosition::Center,
                             inline: ScrollLogicalPosition::Center,
@@ -3459,6 +3462,7 @@ impl Document {
                 DomRefCell::new(AnimationTimeline::new())
             },
             animations: DomRefCell::new(Animations::new()),
+            smooth_scroll_animations: DomRefCell::new(SmoothScrollAnimations::new()),
             image_animation_manager: DomRefCell::new(ImageAnimationManager::default()),
             dirty_root: Default::default(),
             declarative_refresh: Default::default(),
@@ -4240,6 +4244,10 @@ impl Document {
         self.animations.borrow()
     }
 
+    pub(crate) fn smooth_scroll_animations(&self) -> Ref<SmoothScrollAnimations> {
+        self.smooth_scroll_animations.borrow()
+    }
+
     pub(crate) fn update_animations_post_reflow(&self) {
         self.animations
             .borrow()
@@ -4249,6 +4257,56 @@ impl Document {
 
     pub(crate) fn cancel_animations_for_node(&self, node: &Node) {
         self.animations.borrow().cancel_animations_for_node(node);
+    }
+
+    /// Update smooth scroll animations and apply new scroll positions.
+    pub(crate) fn update_smooth_scroll_animations(&self, _can_gc: CanGc) {
+        let smooth_scrolls = self.smooth_scroll_animations.borrow();
+        let positions_to_apply = smooth_scrolls.update_animations(&self.window);
+        let mut any_complete_event = false;
+
+        // Apply updated scroll positions
+        for (scroll_id, position, is_running) in positions_to_apply {
+            let reflow_phases_run = self.window.reflow(ReflowGoal::UpdateScrollNode(
+                scroll_id,
+                Vector2D::new(position.x, position.y),
+            ));
+
+            // Fire scroll events if position changed
+            if reflow_phases_run.contains(ReflowPhasesRun::UpdatedScrollNodeOffset) {
+                if scroll_id == self.window.pipeline_id().root_scroll_id() {
+                    self.handle_viewport_scroll_event();
+
+                    // If scrolling isn't running anymore, then it is complete
+                    if !is_running {
+                        any_complete_event = true;
+                        self.handle_viewport_scrollend_event();
+                    }
+                } else {
+                    let element = smooth_scrolls.find_element_for_scroll_id(scroll_id);
+                    if let Some(element) = element {
+                        self.handle_element_scroll_event(&element);
+                        if !is_running {
+                            any_complete_event = true;
+                            self.handle_element_scrollend_event(&element);
+                        }
+                    }
+                }
+            }
+        }
+        if any_complete_event {
+            // Schedule scrollend event dispatch to happen after current JavaScript execution
+            // This ensures that any JavaScript event listeners added synchronously have time to register
+            let document = Trusted::new(&*self);
+            self.window
+                .as_global_scope()
+                .task_manager()
+                .dom_manipulation_task_source()
+                .queue(task!(fire_instant_scrollend: move || {
+                    let document = document.root();
+                    document.handle_scroll_complete_event(CanGc::note());
+                }));
+        }
     }
 
     /// An implementation of <https://drafts.csswg.org/web-animations-1/#update-animations-and-send-events>.
@@ -4269,6 +4327,9 @@ impl Document {
             .borrow()
             .update_for_new_timeline_value(&self.window, current_timeline_value);
         self.maybe_mark_animating_nodes_as_dirty();
+
+        // Update smooth scroll animations
+        self.update_smooth_scroll_animations(can_gc);
 
         // > 3. Perform a microtask checkpoint.
         self.window()
@@ -4292,7 +4353,9 @@ impl Document {
         image_animation_manager
             .update_active_frames(&self.window, self.current_animation_timeline_value());
 
-        if !self.animations().animations_present() {
+        if !self.animations().animations_present() &&
+            !self.smooth_scroll_animations().has_running_animations()
+        {
             let next_scheduled_time = image_animation_manager
                 .next_scheduled_time(self.current_animation_timeline_value());
             // TODO: Once we have refresh signal from the compositor,

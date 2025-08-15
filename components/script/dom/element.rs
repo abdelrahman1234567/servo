@@ -24,7 +24,7 @@ use html5ever::{LocalName, Namespace, Prefix, QualName, local_name, namespace_pr
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::HandleObject;
-use layout_api::LayoutDamage;
+use layout_api::{FragmentType, LayoutDamage, combine_id_with_fragment_type};
 use net_traits::ReferrerPolicy;
 use net_traits::request::CorsSettings;
 use selectors::Element as SelectorsElement;
@@ -63,6 +63,7 @@ use style::{ArcSlice, CaseSensitivityExt, dom_apis, thread_state};
 use style_traits::ParsingMode as CssParsingMode;
 use stylo_atoms::Atom;
 use stylo_dom::ElementState;
+use webrender_api::ExternalScrollId;
 use xml5ever::serialize::TraversalScope::{
     ChildrenOnly as XmlChildrenOnly, IncludeNode as XmlIncludeNode,
 };
@@ -952,11 +953,26 @@ impl Element {
                             block,
                             inline,
                         );
-                        // Step 1.3: Check if scroll is needed
-                        // TODO: check if scrolling box has an ongoing smooth scroll
+
+                        // Step 1.3: Check if scroll is needed or if there's an ongoing smooth scroll
                         let current_scroll_x = element.ScrollLeft();
                         let current_scroll_y = element.ScrollTop();
-                        if position.x != current_scroll_x || position.y != current_scroll_y {
+                        let window = target_document.window();
+                        let scroll_id = ExternalScrollId(
+                            combine_id_with_fragment_type(
+                                element.upcast::<Node>().to_opaque().id(),
+                                FragmentType::FragmentBody,
+                            ),
+                            window.pipeline_id().into(),
+                        );
+                        let has_ongoing_smooth_scroll = target_document
+                            .smooth_scroll_animations()
+                            .has_animation_for_scroll_id(scroll_id);
+
+                        if position.x != current_scroll_x ||
+                            position.y != current_scroll_y ||
+                            has_ongoing_smooth_scroll
+                        {
                             // Step 1.3.1: If scrolling box is associated with an element:
                             // Perform a scroll of the element’s scrolling box to position,
                             // with the element as the associated element and behavior as the scroll behavior.
@@ -972,11 +988,19 @@ impl Element {
                             block,
                             inline,
                         );
-                        // Step 1.3: Check if scroll is needed
+                        // Step 1.3: Check if scroll is needed or if there's an ongoing smooth scroll
                         let window = viewport.window();
                         let current_scroll_x = window.ScrollX() as f64;
                         let current_scroll_y = window.ScrollY() as f64;
-                        if position.x != current_scroll_x || position.y != current_scroll_y {
+                        let root_scroll_id = window.pipeline_id().root_scroll_id();
+                        let has_ongoing_smooth_scroll = viewport
+                            .smooth_scroll_animations()
+                            .has_animation_for_scroll_id(root_scroll_id);
+
+                        if position.x != current_scroll_x ||
+                            position.y != current_scroll_y ||
+                            has_ongoing_smooth_scroll
+                        {
                             // Step 1.3.2: Perform a scroll of the viewport to position, with root
                             // element as the associated element
                             window.scroll(position.x, position.y, behavior);

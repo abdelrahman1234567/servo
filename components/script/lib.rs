@@ -22,6 +22,7 @@ extern crate stylo_atoms;
 
 mod animation_timeline;
 mod animations;
+mod smooth_scroll;
 #[macro_use]
 mod task;
 mod body;

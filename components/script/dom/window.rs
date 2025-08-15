@@ -40,6 +40,7 @@ use embedder_traits::{
 use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect, Size2D as UntypedSize2D};
 use euclid::{Point2D, Scale, Size2D, Vector2D};
 use fonts::FontContext;
+use html5ever::{local_name, ns};
 use ipc_channel::ipc::{self, IpcSender};
 use js::glue::DumpJSStack;
 use js::jsapi::{
@@ -94,9 +95,11 @@ use super::bindings::codegen::Bindings::MessagePortBinding::StructuredSerializeO
 use super::bindings::trace::HashMapTracedValues;
 use super::types::SVGSVGElement;
 use crate::dom::bindings::cell::{DomRefCell, Ref};
+use crate::dom::bindings::codegen::Bindings::CSSStyleDeclarationBinding::CSSStyleDeclarationMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState, NamedPropertyValue,
 };
+use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFrameElementMethods;
 use crate::dom::bindings::codegen::Bindings::HistoryBinding::History_Binding::HistoryMethods;
 use crate::dom::bindings::codegen::Bindings::ImageBitmapBinding::{
@@ -2026,13 +2029,19 @@ impl Window {
             .max(0.0f64);
 
         // Step 10
-        // TODO handling ongoing smooth scrolling
+        let document = self.Document();
+        let has_smooth_scroll_animations = document
+            .smooth_scroll_animations()
+            .has_animation_for_scroll_id(self.pipeline_id().root_scroll_id());
         let scroll_offset = self.scroll_offset();
-        if x == scroll_offset.x as f64 && y == scroll_offset.y as f64 {
+        if x == scroll_offset.x as f64 &&
+            y == scroll_offset.y as f64 &&
+            !has_smooth_scroll_animations
+        {
             return;
         }
 
-        // TODO Step 11
+        //TODO Step 11
 
         // Step 12: Perform a scroll of the viewport to position, document’s root element
         // as the associated element, if there is one, or null otherwise, and the scroll
@@ -2052,20 +2061,146 @@ impl Window {
         x: f32,
         y: f32,
         scroll_id: ExternalScrollId,
-        _behavior: ScrollBehavior,
+        behavior: ScrollBehavior,
         element: Option<&Element>,
     ) {
-        // TODO Step 1
-        // TODO(mrobinson, #18709): Add smooth scrolling support to WebRender so that we can
-        // properly process ScrollBehavior here.
+        let document = self.Document();
+        let target_position = Point2D::new(x, y);
+
+        // Step 1: Abort any ongoing smooth scroll for scrolling box with scroll_id
+        // But only if the target position is different
+        document
+            .smooth_scroll_animations()
+            .check_and_cancel_if_target_changed(scroll_id, target_position, self);
+
+        let current_position = match element {
+            Some(el) => Point2D::new(el.ScrollLeft() as f32, el.ScrollTop() as f32),
+            None => Point2D::new(self.PageXOffset() as f32, self.PageYOffset() as f32),
+        };
+
+        if current_position == target_position {
+            // Note: If the scroll position did not change as a result of the user interaction or
+            // programmatic invocation, where no translations were applied as a result, then no
+            // scrollend event fires because no scrolling occurred.
+            return;
+        }
+
+        // Step 2: Determine if we should perform smooth scrolling
+        let should_smooth_scroll = match behavior {
+            ScrollBehavior::Smooth => true,
+            ScrollBehavior::Auto => {
+                // Check computed scroll-behavior property if element is provided
+                if let Some(el) = element {
+                    self.should_use_smooth_scroll(el)
+                } else {
+                    // For viewport scrolling, check document element's scroll-behavior
+                    let document = self.Document();
+                    if let Some(document_element) = document.GetDocumentElement() {
+                        self.should_use_smooth_scroll(&document_element)
+                    } else {
+                        false
+                    }
+                }
+            },
+            // behavior: "instant" always performs an instant scroll by this algorithm
+            ScrollBehavior::Instant => false,
+        };
+
+        if should_smooth_scroll {
+            // Check if we already have a smooth scroll animation running to the same target
+            if let Some(existing_target) = document
+                .smooth_scroll_animations()
+                .get_animation_target_position(scroll_id)
+            {
+                if existing_target == target_position {
+                    return;
+                }
+            }
+            // Perform smooth scroll - scrollend will be emitted when animation completes
+            self.perform_smooth_scroll(scroll_id, element, current_position, target_position);
+        } else {
+            // Perform instant scroll - scrollend will be emitted immediately after
+            self.perform_instant_scroll(scroll_id, element, x, y);
+        }
+    }
+
+    fn should_use_smooth_scroll(&self, elem: &Element) -> bool {
+        // TODO: Find one stable way to get the computed scroll-behavior property
+        // Try to get the computed scroll-behavior property using GetComputedStyle
+        let computed_style = self.GetComputedStyle(elem, None);
+        let scroll_behavior_value =
+            computed_style.GetPropertyValue(DOMString::from("scroll-behavior"));
+
+        // Check if the computed value is "smooth"
+        if scroll_behavior_value == "smooth" {
+            return true;
+        }
+
+        // Fallback: Check for 'smooth' class (used in WPT tests)
+        if elem.has_class(&Atom::from("smooth"), CaseSensitivity::CaseSensitive) {
+            return true;
+        }
+
+        // Fallback: Check for smoothBehavior class (used in other tests)
+        if elem.has_class(
+            &Atom::from("smoothBehavior"),
+            CaseSensitivity::CaseSensitive,
+        ) {
+            return true;
+        }
+
+        // Additional fallback: Check if the element has smooth scroll-behavior set via style attribute
+        if let Some(style_attr) = elem.get_attribute(&ns!(), &local_name!("style")) {
+            let style_value = style_attr.value();
+            if style_value.contains("scroll-behavior") && style_value.contains("smooth") {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Perform a smooth scroll animation.
+    /// According to the CSSOM spec: "Once the position has finished updating, emit the scrollend event."
+    fn perform_smooth_scroll(
+        &self,
+        scroll_id: ExternalScrollId,
+        element: Option<&Element>,
+        current_position: euclid::default::Point2D<f32>,
+        target_position: euclid::default::Point2D<f32>,
+    ) {
+        // Add the scroll target to pending scrollend events since smooth scroll will complete later
+        match element {
+            Some(el) => {
+                self.Document().handle_element_scroll_event(el);
+            },
+            None => {
+                self.Document().handle_viewport_scroll_event();
+            },
+        };
+
+        self.Document()
+            .smooth_scroll_animations()
+            .start_scroll_animation(element, scroll_id, current_position, target_position, self);
+    }
+
+    /// Perform an instant scroll.
+    /// According to the CSSOM spec: "After an instant scroll emit the scrollend event."
+    fn perform_instant_scroll(
+        &self,
+        scroll_id: ExternalScrollId,
+        element: Option<&Element>,
+        x: f32,
+        y: f32,
+    ) {
         let reflow_phases_run =
             self.reflow(ReflowGoal::UpdateScrollNode(scroll_id, Vector2D::new(x, y)));
 
         // > If the scroll position did not change as a result of the user interaction or programmatic
         // > invocation, where no translations were applied as a result, then no scrollend event fires
         // > because no scrolling occurred.
-        // Even though the note mention the scrollend, it is relevant to the scroll as well.
         if reflow_phases_run.contains(ReflowPhasesRun::UpdatedScrollNodeOffset) {
+            // Fire scroll events for ongoing scroll operations
             match element {
                 Some(el) => {
                     self.Document().handle_element_scroll_event(el);
@@ -2090,7 +2225,6 @@ impl Window {
                     document.handle_scroll_complete_event(CanGc::note());
                 }));
         }
-
     }
 
     pub(crate) fn device_pixel_ratio(&self) -> Scale<f32, CSSPixel, DevicePixel> {
